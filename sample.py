@@ -16,12 +16,11 @@ from langchain import hub
 from langchain.tools import Tool
 
 # %%
-# APIキーは環境変数に格納しておく
+# llm = ChatOpenAI(model="gpt-5-mini")
 llm = ChatOpenAI(model="gpt-4o")
-
 # %%
 prompt = hub.pull("hwchase17/react")
-prompt
+print(prompt)
 
 # %%
 def get_word_length(word: str) -> int:
@@ -44,3 +43,5 @@ agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
 # %%
 agent_executor.invoke({"input": "abcの文字数を教えてください"})
+
+# %%
