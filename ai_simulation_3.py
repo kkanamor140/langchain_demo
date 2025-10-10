@@ -1,4 +1,5 @@
 # AI対AIの会話をシミュレーションする
+# デバッグモードとpydanticモデルによる出力検証を追加
 
 # %%
 from langchain_openai import ChatOpenAI
