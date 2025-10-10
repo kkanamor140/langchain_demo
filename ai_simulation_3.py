@@ -44,7 +44,15 @@ class TesterOutput(BaseModel):
             behavior = self.behavior or {}
             quality = self.quality or {}
             required_behavior = {"pre_hearing", "post_hearing_plan", "reject_irrelevant"}
-            required_quality = {"match", "destination", "budget", "transport", "purpose", "explain_match"}
+            required_quality = {
+                "match",
+                "destination",
+                "budget",
+                "transport",
+                "purpose",
+                "explain_match",
+                "change_request",
+            }
             missing_behavior = required_behavior - set(behavior.keys())
             missing_quality = required_quality - set(quality.keys())
             if missing_behavior or missing_quality or not (self.comments and self.comments.strip()):
@@ -120,6 +128,8 @@ def invoke_tester(conversation_messages):
         raise RuntimeError(f"TesterOutput parse failed: {raw_content}") from exc
     debug_log("tester_parsed", parsed)
     return parsed
+
+# NOTE: **内部メモ(change_request_sent)について**: 実際の出力には影響しないがCoTの振る舞いを安定させるためにアルゴリズムのように記述している
 TESTER_SYS = """
 あなたは旅行支援アシスタントbotのテスターです。
 
@@ -130,10 +140,12 @@ TESTER_SYS = """
 - 会話モードでは behavior/quality/comments を必ず null にしてください。評価モードでは message を必ず null にしてください。
 
 モード切替ルール:
-- 直前のアシスタント出力がプランの提案であれば「評価モード」で次のJSONを返す:
+- 内部メモ `change_request_sent` を用いて、初期値は false とする。
+- 直前のアシスタント出力がプランの提案であり、`change_request_sent` が false の場合は「会話モード」で変更リクエストを**1つだけ**伝える。その返信を出したら `change_request_sent` を true に更新する。
+- 直前のアシスタント出力がプランの提案であり、`change_request_sent` が true の場合は「評価モード」で次のJSONを返す:
 {"mode":"evaluation",
  "behavior":{"pre_hearing":"OK/NG","post_hearing_plan":"OK/NG","reject_irrelevant":"OK/NG"},
- "quality":{"match":"OK/NG","destination":"OK/NG","budget":"OK/NG","transport":"OK/NG","purpose":"OK/NG","explain_match":"OK/NG"},
+ "quality":{"match":"OK/NG","destination":"OK/NG","budget":"OK/NG","transport":"OK/NG","purpose":"OK/NG","explain_match":"OK/NG","change_request":"OK/NG"},
  "comments":"..."}
 - それ以外は「会話モード」でアシスタントに送信するメッセージを含む次のJSONを**1つのみ**返却し、アシスタントの応答が入力されるまで待機してください:
 {"mode":"user_message","message":"..."}
@@ -152,6 +164,7 @@ TESTER_SYS = """
 - ヒアリング結果に沿っているか（match）
 - 目的地/予算/交通/目的を考慮できているか
 - 要望に合致していることの説明（explain_match）
+- 変更リクエストに応えられているか（change_request）
 """.strip()
 
 # %%
