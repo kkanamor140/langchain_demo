@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import random
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Literal, TypedDict
 
@@ -76,7 +77,7 @@ class TesterOutput(BaseModel):
 
 
 class ControllerDecision(BaseModel):
-    mode: Literal["conversation", "change_request", "evaluation"]
+    mode: Literal["conversation", "change_request", "off_topic", "evaluation"]
     reason: str
 
 
@@ -134,19 +135,19 @@ class GraphState(TypedDict):
 CONTROLLER_SYS = """
 あなたは旅行支援アシスタントのテスターを統括するコントローラです。
 与えられた会話ログとテスター内部状態を確認し、次に行うモードを決めてください。
-- conversation: ヒアリング段階または雑談時。通常のユーザーメッセージを返させる。
+- conversation: ヒアリング段階。旅行に関する通常のユーザーメッセージを返させる。
 - change_request: アシスタントが初回プランを出した直後に一度だけ選択し、変更依頼を伝える。
 - evaluation: すべてのやり取りが終わり、アシスタントの最終プランを評価するとき。
-change_request は1回のみ。評価は変更依頼への対応後に行う。
+change_request と off_topic はそれぞれ1回のみ。評価は変更依頼への対応後に行う。
 出力はJSONのみで、{"mode": "...","reason":"..."} の形式。
 """.strip()
 
 
 CONVERSATION_SYS = """
 あなたは旅行支援アシスタントと会話するユーザーです。常に日本語で自然な1文を返してください。
+- mode が conversation のときは旅行相談に必要な情報提供や通常のやり取りを行う。
+- mode が off_topic のときは旅行と関係ない雑談を短く1文で行う。
 - mode が change_request のとき、直前のアシスタント提案に対する具体的な修正要望を1つだけ述べる。
-- mode が conversation のときは通常のヒアリング回答や雑談を行う。
-- travel unrelated な話題は会話中に1度だけ行い、状態 off_topic_used が true なら再び触れない。
 - 要望は同時に最大2つまでに留める。
 出力はJSONのみで {"message":"..."}。
 """.strip()
@@ -191,6 +192,12 @@ def invoke_conversation_agent(
     state: TesterState,
     mode: Literal["conversation", "change_request"],
 ) -> ConversationOutput:
+    if mode == "conversation":
+        if state.off_topic_used:
+            parsed.mode = "conversation"
+        elif random.random() < 0.5:
+            mode = "off_topic"
+            debug_log("switch_to_off_topic", True)
     payload = json.dumps(
         {
             "mode": mode,
@@ -260,9 +267,10 @@ def planner_node(state: GraphState) -> Dict[str, Any]:
 
 
 def controller_node(state: GraphState) -> Dict[str, Any]:
-    decision = invoke_controller(state["messages"], state["tester_state"])
+    tester_state = replace(state["tester_state"])
+    decision = invoke_controller(state["messages"], tester_state)
     print(f"[Controller] mode={decision.mode} reason={decision.reason}")
-    return {"controller_decision": decision}
+    return {"controller_decision": decision, "tester_state": tester_state}
 
 
 def conversation_node(state: GraphState) -> Dict[str, Any]:
@@ -282,7 +290,7 @@ def conversation_node(state: GraphState) -> Dict[str, Any]:
 
     if decision.mode == "change_request":
         tester_state.change_request_sent = True
-    if not tester_state.off_topic_used and "旅行" not in convo.message:
+    if decision.mode == "off_topic":
         tester_state.off_topic_used = True
 
     new_messages = [*state["messages"], {"role": "user", "content": convo.message}]
@@ -329,6 +337,7 @@ def build_multiagent_graph() -> Any:
         {
             "conversation": "conversation",
             "change_request": "conversation",
+            "off_topic": "conversation",
             "evaluation": "evaluation",
         },
     )
@@ -356,5 +365,18 @@ def run_simulation(turn_limit: int = 15) -> TesterOutput | None:
     return final_state.get("evaluation")
 
 
+def save_multiagent_graph_png(path: str = "multiagent_graph.png") -> None:
+    """Render the compiled LangGraph to a PNG file (requires Graphviz)."""
+    MULTIAGENT_GRAPH.get_graph().draw_png(path)
+
+
+def save_multiagent_graph_mermaid(path: str = "multiagent_graph.mmd") -> None:
+    """Export the graph as Mermaid text for tools that accept Mermaid diagrams."""
+    content = MULTIAGENT_GRAPH.get_graph().draw_mermaid()
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(content)
+
+
 if __name__ == "__main__":
     run_simulation()
+    save_multiagent_graph_mermaid()
