@@ -143,13 +143,19 @@ change_request と off_topic はそれぞれ1回のみ。評価は変更依頼�
 """.strip()
 
 
-CONVERSATION_SYS = """
+CONVERSATION_PERSONA = """
+あなたはゴルフが大好きな30代前半の会社員で、親しみやすい砕けた口調で話す。妻と2人での1泊2日の国内旅行を計画中。自然の中でリフレッシュしたいと考えています。
+""".strip()
+
+
+CONVERSATION_SYS = f"""
 あなたは旅行支援アシスタントと会話するユーザーです。常に日本語で自然な1文を返してください。
+- {CONVERSATION_PERSONA}
 - mode が conversation のときは旅行相談に必要な情報提供や通常のやり取りを行う。
 - mode が off_topic のときは旅行と関係ない雑談を短く1文で行う。
 - mode が change_request のとき、直前のアシスタント提案に対する具体的な修正要望を1つだけ述べる。
 - 要望は同時に最大2つまでに留める。
-出力はJSONのみで {"message":"..."}。
+出力はJSONのみで {{"message":"..."}}。
 """.strip()
 
 
