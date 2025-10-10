@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import random
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Literal, TypedDict
 
@@ -14,6 +13,174 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 dotenv.load_dotenv()
 
+
+DEFAULT_EVALUATION_CRITERIA: Dict[str, list[str]] = {
+    "behavior": [
+        "ヒアリング前の適切な導入ができているか",
+        "提案後にユーザーの要望へ応じた調整ができているか",
+        "旅行と無関係な話題を適切に扱えているか",
+    ],
+    "quality": [
+        "提案内容がユーザーの希望に合致しているか",
+        "目的地の説明が十分か",
+        "交通手段の提案が妥当か",
+        "予算へ配慮できているか",
+        "旅行目的に沿った構成か",
+        "提案理由が明確か",
+        "変更要望に応えられているか",
+    ],
+}
+
+
+def _parse_evaluation_criteria_text(text: str) -> Dict[str, list[str]]:
+    """Parse YAML text into category -> list of criteria with graceful fallback."""
+    try:
+        import yaml  # type: ignore
+    except ModuleNotFoundError:
+        yaml = None  # type: ignore
+
+    def _fallback_parse(raw: str) -> Dict[str, list[str]]:
+        """Legacy bullet parser for backward compatibility."""
+        sections: Dict[str, list[str]] = {}
+        current: str | None = None
+        for raw_line in raw.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                current = line[1:-1].strip()
+                sections.setdefault(current, [])
+                continue
+            if line.startswith("-"):
+                bullet = line.lstrip("-").strip()
+                if not bullet:
+                    continue
+                target = current or "quality"
+                sections.setdefault(target, []).append(bullet)
+        return {key: value for key, value in sections.items() if value}
+
+    if yaml is None:
+        return _fallback_parse(text)
+
+    try:
+        loaded = yaml.safe_load(text) or {}
+    except Exception:
+        return _fallback_parse(text)
+
+    sections: Dict[str, list[str]] = {}
+    if isinstance(loaded, dict):
+        for category, items in loaded.items():
+            if not isinstance(items, list):
+                continue
+            cleaned = [str(item).strip() for item in items if str(item).strip()]
+            if cleaned:
+                sections[str(category)] = cleaned
+    elif isinstance(loaded, list):
+        # Treat top-level list as quality criteria when no mapping provided.
+        cleaned = [str(item).strip() for item in loaded if str(item).strip()]
+        if cleaned:
+            sections["quality"] = cleaned
+    else:
+        return _fallback_parse(text)
+
+    return sections or _fallback_parse(text)
+
+
+def _load_evaluation_criteria() -> Dict[str, list[str]]:
+    """Load evaluation criteria from file path in env or fall back to defaults."""
+    path = os.environ.get("EVALUATION_CRITERIA_PATH")
+    if not path:
+        return DEFAULT_EVALUATION_CRITERIA
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            parsed_text = handle.read()
+    except OSError:
+        return DEFAULT_EVALUATION_CRITERIA
+    parsed = _parse_evaluation_criteria_text(parsed_text)
+    # ensure required categories exist; fall back to defaults if absent
+    criteria: Dict[str, list[str]] = {}
+    for category, items in parsed.items():
+        if items:
+            criteria[category] = items
+    for category, default_items in DEFAULT_EVALUATION_CRITERIA.items():
+        criteria.setdefault(category, default_items)
+    return criteria
+
+
+EVALUATION_CRITERIA = _load_evaluation_criteria()
+
+
+def _build_evaluation_key_map(criteria: Dict[str, list[str]]) -> Dict[str, Dict[str, str]]:
+    key_map: Dict[str, Dict[str, str]] = {}
+    for category, items in criteria.items():
+        mapping: Dict[str, str] = {}
+        for idx, name in enumerate(items, start=1):
+            key = f"{category}_{idx}"
+            mapping[key] = name
+        key_map[category] = mapping
+    return key_map
+
+
+EVALUATION_KEY_MAP = _build_evaluation_key_map(EVALUATION_CRITERIA)
+EVALUATION_REQUIRED_KEYS = {
+    category: set(mapping.keys()) for category, mapping in EVALUATION_KEY_MAP.items()
+}
+EVALUATION_SECTION_TITLES = {
+    "behavior": "行動",
+    "quality": "品質",
+}
+EVALUATION_SECTION_ORDER = [*EVALUATION_CRITERIA.keys()]
+
+
+def _format_evaluation_prompt(
+    criteria: Dict[str, list[str]],
+    key_map: Dict[str, Dict[str, str]],
+) -> str:
+    lines: list[str] = [
+        "あなたは旅行支援アシスタントの評価担当です。",
+        "最新の提案を確認し、各評価項目に対して OK または NG を必ず付与してください。",
+        "評価カテゴリとキーは次の通りです。",
+    ]
+    for category in EVALUATION_SECTION_ORDER:
+        items = criteria.get(category, [])
+        if not items:
+            continue
+        title = EVALUATION_SECTION_TITLES.get(category, category)
+        lines.append(f"- {title} ({category}):")
+        for key, name in key_map.get(category, {}).items():
+            lines.append(f"  - {key}: {name}")
+    lines.append(
+        "出力はJSONのみで、次の形式を厳守してください。各キーの値は \"OK\" または \"NG\" を設定します。"
+    )
+    example_lines: list[str] = ['{"mode":"evaluation",']
+    for idx, category in enumerate(EVALUATION_SECTION_ORDER):
+        keys = list(key_map.get(category, {}).keys())
+        if keys:
+            inner = ", ".join(f'"{key}":"OK/NG"' for key in keys)
+            line = f' "{category}":{{{inner}}},'
+        else:
+            line = f' "{category}":{{}},'
+        example_lines.append(line)
+    example_lines.append(' "comments":"全体のフィードバック"}')
+    lines.append("\n".join(example_lines))
+    return "\n".join(lines)
+
+
+def _summarize_section(
+    section: str,
+    values: Dict[str, str] | None,
+    key_map: Dict[str, Dict[str, str]],
+) -> str:
+    mapping = key_map.get(section, {})
+    if not mapping:
+        return "-"
+    ordered_keys = list(mapping.keys())
+    display_items: list[str] = []
+    for key in ordered_keys:
+        label = mapping[key]
+        result = (values or {}).get(key, "?")
+        display_items.append(f"{label}:{result}")
+    return " / ".join(display_items)
 
 # Shared utility: extract LangChain content regardless of structure
 def extract_content(content: Any) -> str:
@@ -56,22 +223,25 @@ class TesterOutput(BaseModel):
         elif self.mode == "evaluation":
             behavior = self.behavior or {}
             quality = self.quality or {}
-            required_behavior = {"pre_hearing", "post_hearing_plan", "reject_irrelevant"}
-            required_quality = {
-                "match",
-                "destination",
-                "budget",
-                "transport",
-                "purpose",
-                "explain_match",
-                "change_request",
-            }
-            missing_behavior = required_behavior - set(behavior.keys())
-            missing_quality = required_quality - set(quality.keys())
-            if missing_behavior or missing_quality or not (self.comments and self.comments.strip()):
-                raise ValueError(
-                    "mode=evaluation では全ての観点とコメントが必須です。"
-                )
+            expected_behavior = EVALUATION_REQUIRED_KEYS.get("behavior", set())
+            expected_quality = EVALUATION_REQUIRED_KEYS.get("quality", set())
+            missing_behavior = expected_behavior - set(behavior.keys())
+            missing_quality = expected_quality - set(quality.keys())
+            extra_behavior = set(behavior.keys()) - expected_behavior
+            extra_quality = set(quality.keys()) - expected_quality
+            valid_values = {"OK", "NG"}
+            invalid_behavior = [v for v in behavior.values() if v not in valid_values]
+            invalid_quality = [v for v in quality.values() if v not in valid_values]
+            if (
+                missing_behavior
+                or missing_quality
+                or extra_behavior
+                or extra_quality
+                or invalid_behavior
+                or invalid_quality
+                or not (self.comments and self.comments.strip())
+            ):
+                raise ValueError("mode=evaluation では全ての観点とコメントが必須です。")
             self.message = None
         return self
 
@@ -136,6 +306,7 @@ CONTROLLER_SYS = """
 あなたは旅行支援アシスタントのテスターを統括するコントローラです。
 与えられた会話ログとテスター内部状態を確認し、次に行うモードを決めてください。
 - conversation: ヒアリング段階。旅行に関する通常のユーザーメッセージを返させる。
+- off_topic: 旅行と無関係な雑談を1度だけ挟む。state.off_topic_used が true の場合は選ばない。
 - change_request: アシスタントが初回プランを出した直後に一度だけ選択し、変更依頼を伝える。
 - evaluation: すべてのやり取りが終わり、アシスタントの最終プランを評価するとき。
 change_request と off_topic はそれぞれ1回のみ。評価は変更依頼への対応後に行う。
@@ -159,15 +330,7 @@ CONVERSATION_SYS = f"""
 """.strip()
 
 
-EVALUATION_SYS = """
-あなたは旅行支援アシスタントの評価担当です。
-アシスタントの最新プランを評価し、必ず次のJSONを返してください。
-{"mode":"evaluation",
- "behavior":{"pre_hearing":"OK/NG","post_hearing_plan":"OK/NG","reject_irrelevant":"OK/NG"},
- "quality":{"match":"OK/NG","destination":"OK/NG","budget":"OK/NG","transport":"OK/NG","purpose":"OK/NG","explain_match":"OK/NG","change_request":"OK/NG"},
- "comments":"全体のフィードバック"}
-コメントは日本語で簡潔に。
-""".strip()
+EVALUATION_SYS = _format_evaluation_prompt(EVALUATION_CRITERIA, EVALUATION_KEY_MAP)
 
 
 def invoke_controller(messages: list[Dict[str, str]], state: TesterState) -> ControllerDecision:
@@ -196,14 +359,8 @@ def invoke_controller(messages: list[Dict[str, str]], state: TesterState) -> Con
 def invoke_conversation_agent(
     messages: list[Dict[str, str]],
     state: TesterState,
-    mode: Literal["conversation", "change_request"],
+    mode: Literal["conversation", "change_request", "off_topic"],
 ) -> ConversationOutput:
-    if mode == "conversation":
-        if state.off_topic_used:
-            parsed.mode = "conversation"
-        elif random.random() < 0.5:
-            mode = "off_topic"
-            debug_log("switch_to_off_topic", True)
     payload = json.dumps(
         {
             "mode": mode,
@@ -309,10 +466,12 @@ def conversation_node(state: GraphState) -> Dict[str, Any]:
 
 def evaluation_node(state: GraphState) -> Dict[str, Any]:
     evaluation = invoke_evaluator(state["messages"])
+    behavior_summary = _summarize_section("behavior", evaluation.behavior, EVALUATION_KEY_MAP)
+    quality_summary = _summarize_section("quality", evaluation.quality, EVALUATION_KEY_MAP)
     print(
         "[[評価結果]]\n"
-        f"行動: {evaluation.behavior}\n"
-        f"品質: {evaluation.quality}\n"
+        f"行動: {behavior_summary}\n"
+        f"品質: {quality_summary}\n"
         f"コメント: {evaluation.comments}"
     )
     return {
