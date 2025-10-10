@@ -1,19 +1,18 @@
-# Prototype: Separate tester controller, conversation agent, and evaluation agent
-# This is a prototype to explore splitting the tester logic into dedicated roles.
-
 from __future__ import annotations
 
 import json
 import os
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Literal
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Literal, TypedDict
 
 import dotenv
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 dotenv.load_dotenv()
+
 
 # Shared utility: extract LangChain content regardless of structure
 def extract_content(content: Any) -> str:
@@ -121,6 +120,15 @@ planner_llm = ChatOpenAI(
 class TesterState:
     change_request_sent: bool = False
     off_topic_used: bool = False
+
+
+class GraphState(TypedDict):
+    messages: list[Dict[str, str]]
+    tester_state: TesterState
+    controller_decision: ControllerDecision | None
+    turn_count: int
+    turn_limit: int
+    evaluation: TesterOutput | None
 
 
 CONTROLLER_SYS = """
@@ -233,40 +241,120 @@ ASSISTANT_SYS = """
 """.strip()
 
 
-def run_simulation(turn_limit: int = 15) -> None:
-    messages: list[Dict[str, str]] = [
-        {"role": "user", "content": "こんにちは。旅行の相談をしたいです。"}
-    ]
-    state = TesterState()
-    for turn in range(turn_limit):
-        if turn % 2 == 0:
-            # Assistant turn
-            assistant_prompt = [{"role": "system", "content": ASSISTANT_SYS}, *messages]
-            debug_log("assistant_prompt", assistant_prompt)
-            start = time.perf_counter()
-            response = planner_llm.invoke(assistant_prompt)
-            latency = (time.perf_counter() - start) * 1000
-            print(f"[Latency] planner_llm: {latency:.2f} ms")
-            content = extract_content(response.content)
-            print(f"[Assistant] {content}")
-            messages.append({"role": "assistant", "content": content})
-        else:
-            # Tester controller decides next action
-            decision = invoke_controller(messages, state)
-            print(f"[Controller] mode={decision.mode} reason={decision.reason}")
-            if decision.mode == "evaluation":
-                evaluation = invoke_evaluator(messages)
-                print(f"[[評価結果]]\n行動: {evaluation.behavior}\n品質: {evaluation.quality}\nコメント: {evaluation.comments}")
-                break
-            convo = invoke_conversation_agent(messages, state, decision.mode)
-            print(f"[User] {convo.message}")
-            messages.append({"role": "user", "content": convo.message})
-            if decision.mode == "change_request":
-                state.change_request_sent = True
-            if not state.off_topic_used and "旅行" not in convo.message:
-                # 粗い判定だが、旅行に触れていないメッセージを雑談として扱いフラグを立てる
-                state.off_topic_used = True
+def planner_node(state: GraphState) -> Dict[str, Any]:
+    if state["turn_count"] >= state["turn_limit"]:
+        raise RuntimeError("Turn limit reached before evaluation.")
+    assistant_prompt = [{"role": "system", "content": ASSISTANT_SYS}, *state["messages"]]
+    debug_log("assistant_prompt", assistant_prompt)
+    start = time.perf_counter()
+    response = planner_llm.invoke(assistant_prompt)
+    latency = (time.perf_counter() - start) * 1000
+    content = extract_content(response.content)
+    print(f"[Latency] planner_llm: {latency:.2f} ms")
+    print(f"[Assistant] {content}")
+    new_messages = [*state["messages"], {"role": "assistant", "content": content}]
+    return {
+        "messages": new_messages,
+        "turn_count": state["turn_count"] + 1,
+    }
+
+
+def controller_node(state: GraphState) -> Dict[str, Any]:
+    decision = invoke_controller(state["messages"], state["tester_state"])
+    print(f"[Controller] mode={decision.mode} reason={decision.reason}")
+    return {"controller_decision": decision}
+
+
+def conversation_node(state: GraphState) -> Dict[str, Any]:
+    decision = state["controller_decision"]
+    if decision is None:
+        raise RuntimeError("conversation_node invoked without controller decision.")
+    if decision.mode == "evaluation":
+        return {"controller_decision": None}
+
+    tester_state = replace(state["tester_state"])
+    convo = invoke_conversation_agent(
+        state["messages"],
+        tester_state,
+        decision.mode,
+    )
+    print(f"[User] {convo.message}")
+
+    if decision.mode == "change_request":
+        tester_state.change_request_sent = True
+    if not tester_state.off_topic_used and "旅行" not in convo.message:
+        tester_state.off_topic_used = True
+
+    new_messages = [*state["messages"], {"role": "user", "content": convo.message}]
+    return {
+        "messages": new_messages,
+        "tester_state": tester_state,
+        "controller_decision": None,
+    }
+
+
+def evaluation_node(state: GraphState) -> Dict[str, Any]:
+    evaluation = invoke_evaluator(state["messages"])
+    print(
+        "[[評価結果]]\n"
+        f"行動: {evaluation.behavior}\n"
+        f"品質: {evaluation.quality}\n"
+        f"コメント: {evaluation.comments}"
+    )
+    return {
+        "evaluation": evaluation,
+        "controller_decision": None,
+    }
+
+
+def _route_from_controller(state: GraphState) -> str:
+    decision = state["controller_decision"]
+    if decision is None:
+        raise RuntimeError("controller decision missing when routing.")
+    return decision.mode
+
+
+def build_multiagent_graph() -> Any:
+    graph = StateGraph(GraphState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("controller", controller_node)
+    graph.add_node("conversation", conversation_node)
+    graph.add_node("evaluation", evaluation_node)
+
+    graph.set_entry_point("planner")
+    graph.add_edge("planner", "controller")
+    graph.add_conditional_edges(
+        "controller",
+        _route_from_controller,
+        {
+            "conversation": "conversation",
+            "change_request": "conversation",
+            "evaluation": "evaluation",
+        },
+    )
+    graph.add_edge("conversation", "planner")
+    graph.add_edge("evaluation", END)
+    return graph.compile()
+
+
+MULTIAGENT_GRAPH = build_multiagent_graph()
+
+
+def run_simulation(turn_limit: int = 15) -> TesterOutput | None:
+    initial_state: GraphState = {
+        "messages": [{"role": "user", "content": "こんにちは。旅行の相談をしたいです。"}],
+        "tester_state": TesterState(),
+        "controller_decision": None,
+        "turn_count": 0,
+        "turn_limit": turn_limit,
+        "evaluation": None,
+    }
+    final_state = MULTIAGENT_GRAPH.invoke(
+        initial_state,
+        config={"recursion_limit": turn_limit * 2 + 4},
+    )
+    return final_state.get("evaluation")
+
 
 if __name__ == "__main__":
     run_simulation()
-
