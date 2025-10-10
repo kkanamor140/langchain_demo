@@ -3,8 +3,10 @@
 # %%
 from langchain_openai import ChatOpenAI
 import dotenv
+import json
 import os
 import openai
+import time
 
 dotenv.load_dotenv()
 
@@ -13,8 +15,8 @@ openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 
 # %%
-from pydantic import BaseModel, Field, model_validator
-from typing import Literal, Dict, Optional
+from pydantic import BaseModel, Field, ValidationError, model_validator
+from typing import Any, Dict, Literal, Optional
 
 
 class TesterOutput(BaseModel):
@@ -28,36 +30,103 @@ class TesterOutput(BaseModel):
     quality: Optional[Dict[str, str]] = None   # OK/NG
     comments: Optional[str] = None
 
-    # @model_validator(mode="after")
-    # def _check_mode_fields(self):
-    #     if self.mode == "user_message":
-    #         if not self.message:
-    #             raise ValueError("mode=user_message のとき message は必須です。")
-    #         # 他方は None に寄せる
-    #         self.behavior = None
-    #         self.quality = None
-    #         self.comments = None
-    #     elif self.mode == "evaluation":
-    #         if not (self.behavior and self.quality and self.comments):
-    #             raise ValueError("mode=evaluation のとき behavior/quality/comments は必須です。")
-    #         self.message = None
-    #     return self
+    @model_validator(mode="after")
+    def _check_mode_fields(self):
+        if self.mode == "user_message":
+            if not (self.message and self.message.strip()):
+                raise ValueError("mode=user_message のとき message は必須です。")
+            # 他フィールドは None に揃える
+            self.behavior = None
+            self.quality = None
+            self.comments = None
+        elif self.mode == "evaluation":
+            behavior = self.behavior or {}
+            quality = self.quality or {}
+            required_behavior = {"pre_hearing", "post_hearing_plan", "reject_irrelevant"}
+            required_quality = {"match", "destination", "budget", "transport", "purpose", "explain_match"}
+            missing_behavior = required_behavior - set(behavior.keys())
+            missing_quality = required_quality - set(quality.keys())
+            if missing_behavior or missing_quality or not (self.comments and self.comments.strip()):
+                raise ValueError(
+                    f"mode=evaluation のとき behavior/quality/comments は必須です。"
+                    f" missing_behavior={missing_behavior}, missing_quality={missing_quality}"
+                )
+            self.message = None
+        return self
 
 # %%
-tester_llm: TesterOutput = (
-    ChatOpenAI(
-        model_name="gpt-5", openai_api_key=openai.api_key, temperature=0.5, max_tokens=4096)
-    .with_structured_output(TesterOutput, strict=True)
-)  # 賢めのモデルを使わないと機能しない
-planner_llm = ChatOpenAI(model_name="gpt-4.1", openai_api_key=openai.api_key, temperature=0.2, max_tokens=4096)
+tester_llm = ChatOpenAI(
+    model_name="gpt-5",
+    openai_api_key=openai.api_key,
+    temperature=0.0,
+    max_tokens=4096,
+)
+planner_llm = ChatOpenAI(
+    model_name="gpt-4.1",
+    openai_api_key=openai.api_key,
+    temperature=0.0,
+    max_tokens=512,
+)
 
+# DEBUGフラグは環境変数で制御（未設定なら無効）
+DEBUG = os.environ.get("TESTER_DEBUG", "0").lower() not in {"0", "false", ""}
+
+
+def debug_log(label: str, payload) -> None:
+    if not DEBUG:
+        return
+    print(f"[DEBUG] {label}: {payload}")
+
+
+def extract_content(content: Any) -> str:
+    """LangChainのmessage.contentがリストで返るケースを吸収する。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for chunk in content:
+            if isinstance(chunk, dict) and "text" in chunk:
+                texts.append(chunk["text"])
+        return "".join(texts)
+    return str(content)
+
+
+def invoke_tester(conversation_messages):
+    prompt = [{"role": "system", "content": TESTER_SYS}, *conversation_messages]
+    debug_log("tester_prompt", prompt)
+    start = time.perf_counter()
+    response = tester_llm.invoke(prompt)
+    latency_ms = (time.perf_counter() - start) * 1000
+    print(f"[Latency] tester_llm: {latency_ms:.2f} ms")
+    additional_kwargs = getattr(response, "additional_kwargs", {}) or {}
+    debug_log("tester_response_meta", additional_kwargs)
+    debug_log("tester_response_object", response)
+    raw_content = extract_content(response.content)
+    if not raw_content.strip():
+        if "tool_calls" in additional_kwargs:
+            tool_calls = additional_kwargs.get("tool_calls") or []
+            if tool_calls:
+                raw_content = tool_calls[0].get("function", {}).get("arguments", "") or raw_content
+        if not raw_content.strip() and "function_call" in additional_kwargs:
+            raw_content = additional_kwargs["function_call"].get("arguments", "") or raw_content
+    debug_log("tester_raw_response", raw_content)
+    try:
+        parsed = TesterOutput.model_validate_json(raw_content)
+    except ValidationError as exc:
+        debug_log("tester_validation_error", exc)
+        raise RuntimeError(f"TesterOutput parse failed: {raw_content}") from exc
+    debug_log("tester_parsed", parsed)
+    return parsed
 TESTER_SYS = """
 あなたは旅行支援アシスタントbotのテスターです。
 
 指示
 - アシスタントとの会話ログを入力します。あなたは**ユーザー役**として旅行支援アシスタントにメッセージを1つ返すか、**評価者役**としてアシスタントの直前の出力に対する評価を返します。
-- モードリ切り替えルールに従い会話モードと評価モードを切り替えて指示にしたがった応答をしてください。
+- モード切り替えルールを参照し、会話モードと評価モードを切り替えて指示にしたがった応答をしてください。
 - 常にJSONのみを出力してください（前後の説明・コードブロック禁止）。
+- 会話モードでは behavior/quality/comments を必ず null にしてください。評価モードでは message を必ず null にしてください。
 
 モード切替ルール:
 - 直前のアシスタント出力がプランの提案であれば「評価モード」で次のJSONを返す:
@@ -87,14 +156,14 @@ TESTER_SYS = """
 # %%
 # 3. ループでAI対AI会話
 messages = [{"role": "user", "content": "こんにちは。旅行の相談をしたいです。"}]
+debug_log("conversation_start", messages)
 for i in range(15):
     if i % 2 != 0:
         # TesterAgentのターン
-        # print([{"role": "system", "content": TESTER_SYS}, *messages])
-        tester_output = tester_llm.invoke([{"role": "system", "content": TESTER_SYS}, *messages])
+        tester_output = invoke_tester(messages)
         if tester_output.mode == "user_message":
             print(f"[User] {tester_output.message}")
-            messages.append({"role": "user", "content": f"[User] {tester_output.message}"})
+            messages.append({"role": "user", "content": tester_output.message or ""})
         else:
             print(f"[[評価結果]]\n行動: {tester_output.behavior}\n品質: {tester_output.quality}\nコメント: {tester_output.comments}")
             break
@@ -115,11 +184,16 @@ for i in range(15):
         - 交通手段
         - 旅の目的
         """
-        assistant_output = planner_llm.invoke([{"role": "system", "content": system}, *messages])
-        print(f"[Assistant] {assistant_output.content}")
-        messages.append({"role": "assistant", "content": f"[Assistant] {assistant_output.content}"})
+        assistant_prompt = [{"role": "system", "content": system}, *messages]
+        debug_log("assistant_prompt", assistant_prompt)
+        assistant_start = time.perf_counter()
+        assistant_output = planner_llm.invoke(assistant_prompt)
+        assistant_latency_ms = (time.perf_counter() - assistant_start) * 1000
+        print(f"[Latency] planner_llm: {assistant_latency_ms:.2f} ms")
+        assistant_content = extract_content(assistant_output.content)
+        debug_log("assistant_raw_response", assistant_content)
+        print(f"[Assistant] {assistant_content}")
+        messages.append({"role": "assistant", "content": assistant_content})
 
-# %%
-tester_output
 
 # %%
